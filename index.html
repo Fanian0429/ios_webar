@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover" />
+  <title>POC_WebAR_GeoSLAM (iOS / 8th Wall)</title>
+  <style>
+    html, body { margin: 0; padding: 0; overflow: hidden; background: #000; }
+
+    /* 8th Wall 不像 WebXR 有專屬的沉浸式 render surface，相機畫面就是畫在這個一般的 <canvas> 上，
+       其餘 UI 疊在上面用一般的 CSS position:fixed 排版即可，不需要 WebXR 的 dom-overlay 機制 */
+    #camerafeed {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      z-index: 0;
+    }
+
+    #ar-overlay-root {
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      z-index: 10; pointer-events: none;
+    }
+    #overlay {
+      position: fixed; top: 0; left: 0; width: 100%;
+      box-sizing: border-box; padding: 54px 14px 10px 14px;
+      font-family: -apple-system, "Noto Sans TC", sans-serif;
+      color: #fff; background: rgba(0,0,0,0.55);
+      font-size: 13px; line-height: 1.6;
+      pointer-events: none;
+    }
+    #controls {
+      position: fixed; bottom: 0; left: 0; width: 100%;
+      box-sizing: border-box; padding: 16px;
+      display: flex; flex-direction: column; align-items: center; gap: 10px;
+      pointer-events: auto;
+    }
+    button {
+      font-size: 15px; padding: 12px 22px; border-radius: 8px; border: none;
+      background: #2979ff; color: #fff; font-weight: bold;
+      -webkit-tap-highlight-color: transparent;
+      transition: background 0.08s ease, transform 0.08s ease, filter 0.08s ease;
+    }
+    button:disabled { background: #555; }
+    #adjust-row, #adjust-row2, #floor-row { display: flex; gap: 8px; }
+    #adjust-row button, #adjust-row2 button, #floor-row button { padding: 8px 14px; font-size: 14px; background: #444; }
+
+    #light-row {
+      display: flex; flex-direction: column; align-items: center; gap: 4px;
+      width: 92%; max-width: 420px;
+    }
+    #light-row label {
+      color: #e6d6ff; font-size: 13px; font-weight: bold;
+    }
+    #light-angle-slider {
+      width: 100%; height: 8px; border-radius: 4px; outline: none;
+      -webkit-appearance: none; appearance: none;
+      background: linear-gradient(to right, #4a148c, #b388ff);
+    }
+    #light-angle-slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 24px; height: 24px; border-radius: 50%;
+      background: #9c27b0; border: 2px solid #f3e5ff;
+      cursor: pointer;
+    }
+    #light-angle-slider::-moz-range-thumb {
+      width: 24px; height: 24px; border-radius: 50%;
+      background: #9c27b0; border: 2px solid #f3e5ff;
+      cursor: pointer;
+    }
+
+    /* 按下時的視覺回饋：灰色按鈕轉藍色、主按鈕變暗，並縮小一點模擬按壓感 */
+    #adjust-row button.pressed, #adjust-row2 button.pressed, #floor-row button.pressed {
+      background: #2979ff;
+      transform: scale(0.94);
+    }
+    #start-btn.pressed {
+      filter: brightness(0.75);
+      transform: scale(0.96);
+    }
+
+    /* 操作說明按鈕：固定在畫面右上角，尺寸跟其他控制按鈕的高度相近 */
+    #info-btn {
+      position: fixed; right: 16px; top: 64px;
+      width: 44px; height: 44px; padding: 0;
+      border: none; border-radius: 50%; background: transparent;
+      pointer-events: auto; z-index: 15;
+      transition: transform 0.08s ease, filter 0.08s ease;
+    }
+    #info-btn img { width: 100%; height: 100%; display: block; }
+    #info-btn.pressed { transform: scale(0.9); filter: brightness(0.85); }
+
+    /* 操作說明視窗：白底半透明，置中顯示，右上角有關閉按鈕 */
+    #info-panel {
+      position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      width: 88%; max-width: 380px; box-sizing: border-box;
+      background: rgba(255, 255, 255, 0.94); color: #222;
+      border-radius: 14px; padding: 22px 20px 18px 20px;
+      pointer-events: auto; z-index: 20;
+      font-family: -apple-system, "Noto Sans TC", sans-serif;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    }
+    #info-panel h3 { margin: 0 0 14px 0; font-size: 16px; color: #333; }
+    #info-panel p { margin: 0 0 10px 0; font-size: 14px; line-height: 1.6; }
+    #info-panel ol { margin: 0; padding-left: 20px; font-size: 14px; line-height: 1.7; }
+    #info-panel li { margin-bottom: 6px; }
+    #info-panel strong { color: #6a1b9a; }
+    #info-close-btn {
+      position: absolute; top: 10px; right: 10px;
+      width: 28px; height: 28px; padding: 0;
+      border: none; border-radius: 50%;
+      background: #e0e0e0; color: #333;
+      font-size: 16px; font-weight: bold; line-height: 1;
+    }
+    #info-close-btn.pressed { transform: scale(0.9); filter: brightness(0.9); }
+
+    #status-line { white-space: pre-line; }
+  </style>
+</head>
+<body>
+
+  <!-- 8th Wall 自己接管相機畫面，直接畫在這顆 canvas 上(XR8.run({canvas: ...}) 指定) -->
+  <canvas id="camerafeed"></canvas>
+
+  <div id="ar-overlay-root">
+    <div id="overlay">
+      <div id="status-line">Not started yet</div>
+    </div>
+
+    <div id="controls">
+      <div id="adjust-row" style="display:none;">
+        <button id="y-up">Height ▲</button>
+        <button id="y-down">Height ▼</button>
+        <button id="rot-minus">-5°</button>
+        <button id="rot-plus">+5°</button>
+      </div>
+      <div id="floor-row" style="display:none;">
+        <button id="floor-up">Upstairs ▲</button>
+        <button id="floor-down">Downstairs ▼</button>
+      </div>
+      <div id="adjust-row2" style="display:none;">
+        <button id="recalibrate-btn">Calibrate by GPS</button>
+        <button id="place-here-btn">Place Here</button>
+      </div>
+      <button id="start-btn">Start AR Experience</button>
+      <div id="light-row" style="display:none;">
+        <label for="light-angle-slider">Light Angle: <span id="light-angle-value">0</span>°</label>
+        <input type="range" id="light-angle-slider" min="0" max="360" step="5" value="0">
+      </div>
+    </div>
+
+    <button id="info-btn" style="display:none;">
+      <img src="./WebAR_icon_info.png" alt="Info" />
+    </button>
+    <div id="info-panel" style="display:none;">
+      <button id="info-close-btn">&times;</button>
+      <h3>Model Status &amp; Troubleshooting</h3>
+      <p>The last line of the status text at the top of the screen shows the current model status and guidance.</p>
+      <p>If you can't see the model correctly, try the following:</p>
+      <ol>
+        <li>The model file is fairly large, so please allow some time for it to finish loading.</li>
+        <li>This iOS version doesn't scan for a floor plane like the Android version — the model is placed a fixed distance in front of you as soon as tracking starts. Use <strong>"Height ▲/▼"</strong> to line it up with the real floor.</li>
+        <li>Tap <strong>"Place Here"</strong> to re-place the model directly in front of you at any time.</li>
+        <li>If none of the above works, reload the page or check your network connection.</li>
+      </ol>
+    </div>
+  </div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.158.0/build/three.module.js"
+    }
+  }
+  </script>
+
+  <!--
+    8th Wall Engine (self-hosted / free, no login or app key required as of the Feb 2026 open-source transition).
+    這裡先用 jsDelivr 上的官方 npm 套件當 CDN 來源方便測試；正式上線建議改成自己下載後 host 在自己的網域下
+    (npm install @8thwall/engine-binary，把 node_modules/@8thwall/engine-binary/dist 複製到專案裡再改這個 src)，
+    避免依賴第三方 CDN 的長期可用性。
+    data-preload-chunks="slam" 會預先載入世界追蹤(World Tracking)需要的模組。
+  -->
+  <script async src="https://cdn.jsdelivr.net/npm/@8thwall/engine-binary@1/dist/xr.js" crossorigin="anonymous" data-preload-chunks="slam"></script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.158.0/examples/jsm/loaders/GLTFLoader.js';
+
+    // ---------------------------------------------------------------
+    // 專案設定：目標建物 GPS 座標與模型資訊(跟 Android/WebXR 版本共用同一組數值)
+    // ---------------------------------------------------------------
+    const TARGET_LAT = 24.183192;
+    const TARGET_LON = 120.613790;
+    const MODEL_URL = './Chanley.glb';
+    const MODEL_SCALE = 1;
+
+    // 羅盤讀值在不同裝置/瀏覽器上常有系統性偏移(常見 ±15~30°)。
+    // 可用「Calibrate by GPS」搭配旋轉/高度按鈕現場修正。
+    let headingOffset = 0;
+
+    // 8th Wall 的世界追蹤沒有「掃描地板、取得平面實際高度」這個步驟(不像 WebXR 的 hit-test)，
+    // 追蹤一開始，世界原點就定在裝置當下位置。這裡用一個「假設使用者手持手機的高度」去估計地板 Y，
+    // 估計難免有誤差，實際使用時請搭配 Height ▲/▼ 按鈕現場微調到跟真實地板切齊。
+    const ASSUMED_EYE_HEIGHT = 1.3; // 公尺
+    const PLACEMENT_DISTANCE = 2.5; // 公尺，模型預設放在使用者前方多遠的地方
+
+    // ---------------------------------------------------------------
+    // 狀態變數
+    // ---------------------------------------------------------------
+    let userLat = null, userLon = null, gpsAccuracy = null;
+    let currentHeading = null;
+    let model = null;
+    let modelPlaced = false;
+
+    let scene = null;
+    let camera = null;
+    let renderer = null;
+    let arStarted = false;
+
+    let lastCameraPosition = null; // { x, y, z }
+    let lastCameraForward = null;  // THREE.Vector3(水平面上的朝向)
+
+    let lastMessage = 'Not started yet';
+
+    const statusEl = document.getElementById('status-line');
+    const startBtn = document.getElementById('start-btn');
+    const adjustRow = document.getElementById('adjust-row');
+    const adjustRow2 = document.getElementById('adjust-row2');
+    const floorRow = document.getElementById('floor-row');
+    const lightRow = document.getElementById('light-row');
+    const lightAngleSlider = document.getElementById('light-angle-slider');
+    const lightAngleValue = document.getElementById('light-angle-value');
+    const infoBtn = document.getElementById('info-btn');
+    const infoPanel = document.getElementById('info-panel');
+    const infoCloseBtn = document.getElementById('info-close-btn');
+
+    lightAngleSlider.addEventListener('input', () => {
+      lightAngleDeg = Number(lightAngleSlider.value);
+      lightAngleValue.textContent = lightAngleDeg;
+    });
+
+    function updateStatus(newMessage) {
+      if (newMessage !== undefined) {
+        lastMessage = newMessage;
+      }
+      const dist = (userLat !== null) ? haversineDistance(userLat, userLon, TARGET_LAT, TARGET_LON).toFixed(1) + ' m' : '-';
+      const brng = (userLat !== null) ? bearing(userLat, userLon, TARGET_LAT, TARGET_LON).toFixed(0) + '°' : '-';
+      statusEl.textContent =
+        `GPS: ${userLat ? userLat.toFixed(6) : '-'}, ${userLon ? userLon.toFixed(6) : '-'} (accuracy ${gpsAccuracy ? gpsAccuracy.toFixed(0)+'m' : '-'})\n` +
+        `Target distance: ${dist}   Bearing: ${brng}\n` +
+        `Compass heading: ${currentHeading !== null ? currentHeading.toFixed(0)+'°' : '-'}   Offset: ${headingOffset}°\n` +
+        lastMessage;
+    }
+
+    // ---------------------------------------------------------------
+    // 地理計算：距離(Haversine)與方位角(Bearing)——跟原專案完全相同，不受 AR 引擎影響
+    // ---------------------------------------------------------------
+    function toRad(deg) { return deg * Math.PI / 180; }
+    function toDeg(rad) { return rad * 180 / Math.PI; }
+
+    function haversineDistance(lat1, lon1, lat2, lon2) {
+      const R = 6371000;
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a = Math.sin(dLat / 2) ** 2 +
+                Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      return R * c;
+    }
+
+    function bearing(lat1, lon1, lat2, lon2) {
+      const y = Math.sin(toRad(lon2 - lon1)) * Math.cos(toRad(lat2));
+      const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+                Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(toRad(lon2 - lon1));
+      const brng = toDeg(Math.atan2(y, x));
+      return (brng + 360) % 360;
+    }
+
+    // ---------------------------------------------------------------
+    // GPS：持續追蹤使用者位置(純瀏覽器 API，跟用哪套 AR 引擎無關，不需要修改)
+    // ---------------------------------------------------------------
+    function startGeolocation() {
+      return new Promise((resolve, reject) => {
+        if (!navigator.geolocation) {
+          reject(new Error('Geolocation not supported by this browser'));
+          return;
+        }
+        navigator.geolocation.watchPosition(
+          (pos) => {
+            userLat = pos.coords.latitude;
+            userLon = pos.coords.longitude;
+            gpsAccuracy = pos.coords.accuracy;
+            updateStatus();
+            resolve();
+          },
+          (err) => {
+            console.error('Geolocation error', err);
+            reject(err);
+          },
+          { enableHighAccuracy: true, maximumAge: 1000, timeout: 10000 }
+        );
+      });
+    }
+
+    // ---------------------------------------------------------------
+    // 羅盤：跟 Android 版本不同，iOS Safari 不支援 deviceorientationabsolute，
+    // 要用舊版 deviceorientation 事件 + 蘋果專屬的 event.webkitCompassHeading 屬性，
+    // 而且 iOS 13+ 一定要在使用者手勢(按鈕點擊)當下呼叫 DeviceOrientationEvent.requestPermission()
+    // 才會跳出權限請求，不能在頁面載入時就默默註冊監聽器。
+    // ---------------------------------------------------------------
+    function startCompass() {
+      const handleOrientation = (event) => {
+        let heading = null;
+        if (typeof event.webkitCompassHeading === 'number') {
+          heading = event.webkitCompassHeading; // iOS：已經是相對正北、順時鐘的角度，不用再換算
+        } else if (event.absolute && event.alpha !== null) {
+          heading = event.alpha; // 萬一之後也在支援 absolute 的瀏覽器上開這個版本，一併相容
+        }
+        if (heading === null) return;
+        currentHeading = (heading + headingOffset + 360) % 360;
+        updateStatus();
+      };
+
+      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        DeviceOrientationEvent.requestPermission().then((state) => {
+          if (state === 'granted') {
+            window.addEventListener('deviceorientation', handleOrientation, true);
+          } else {
+            updateStatus('Compass permission denied. GPS calibration will not work correctly.');
+          }
+        }).catch((err) => {
+          console.error('DeviceOrientationEvent permission error', err);
+        });
+      } else {
+        window.addEventListener('deviceorientationabsolute', handleOrientation, true);
+        window.addEventListener('deviceorientation', handleOrientation, true);
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // 按鈕按壓視覺回饋(跟原專案相同)
+    // ---------------------------------------------------------------
+    function addPressEffect(btn) {
+      const press = () => btn.classList.add('pressed');
+      const release = () => btn.classList.remove('pressed');
+      btn.addEventListener('pointerdown', press);
+      btn.addEventListener('pointerup', release);
+      btn.addEventListener('pointerleave', release);
+      btn.addEventListener('pointercancel', release);
+    }
+    document.querySelectorAll('#controls button').forEach(addPressEffect);
+    addPressEffect(infoBtn);
+    addPressEffect(infoCloseBtn);
+
+    infoBtn.addEventListener('click', () => { infoPanel.style.display = 'block'; });
+    infoCloseBtn.addEventListener('click', () => { infoPanel.style.display = 'none'; });
+
+    document.getElementById('y-up').addEventListener('click', () => {
+      if (!model) return;
+      model.position.y += 0.1;
+      updateStatus('Height raised by 0.1m (current Y: ' + model.position.y.toFixed(2) + ')');
+    });
+    document.getElementById('y-down').addEventListener('click', () => {
+      if (!model) return;
+      model.position.y -= 0.1;
+      updateStatus('Height lowered by 0.1m (current Y: ' + model.position.y.toFixed(2) + ')');
+    });
+    document.getElementById('rot-plus').addEventListener('click', () => {
+      if (!model) return;
+      model.rotation.y += toRad(5);
+      updateStatus('Rotated +5° (clockwise)');
+    });
+    document.getElementById('rot-minus').addEventListener('click', () => {
+      if (!model) return;
+      model.rotation.y -= toRad(5);
+      updateStatus('Rotated -5° (counter-clockwise)');
+    });
+    document.getElementById('floor-up').addEventListener('click', () => {
+      if (!model) return;
+      model.position.y -= 3;
+      updateStatus('Moved up one floor (+3m, current Y: ' + model.position.y.toFixed(2) + ')');
+    });
+    document.getElementById('floor-down').addEventListener('click', () => {
+      if (!model) return;
+      model.position.y += 3;
+      updateStatus('Moved down one floor (-3m, current Y: ' + model.position.y.toFixed(2) + ')');
+    });
+    document.getElementById('recalibrate-btn').addEventListener('click', () => {
+      if (lastCameraPosition && lastCameraForward) {
+        placeModelFromCache();
+      } else {
+        updateStatus('Tracking not ready yet. Cannot calibrate.');
+      }
+    });
+    document.getElementById('place-here-btn').addEventListener('click', () => {
+      placeModelInFrontOfCamera('Model placed in front of you.');
+    });
+
+    // ---------------------------------------------------------------
+    // 光照/陰影/邊緣線/模型載入相關函式：跟 Android/WebXR 版本完全相同的邏輯，
+    // 純粹操作 Three.js 的 scene/model，不涉及任何 AR 引擎特定的 API，直接沿用。
+    // ---------------------------------------------------------------
+    let hemiLight, mainLight, previewGround;
+    let MAIN_LIGHT_DISTANCE = 5;
+    const modelCenterLocalOffset = new THREE.Vector3(0, 0, 0);
+    const modelBaseLocalPoint = new THREE.Vector3(0, 0, 0);
+    let lightAngleDeg = 0;
+
+    const USE_VSM_SHADOWS = false;
+    const LIGHTING_PROFILE = { mainIntensity: 1.2, hemiIntensity: 2, shadows: true };
+    const SHOW_EDGES = true;
+    const EDGE_COLOR = 0x000000;
+    const EDGE_ANGLE_THRESHOLD = 30;
+    const USE_FLAT_SHADING_FALLBACK = false;
+    const FORCE_DOUBLE_SIDED = false;
+
+    function setupLighting() {
+      hemiLight = new THREE.HemisphereLight(0xffffff, 0xcccccc, LIGHTING_PROFILE.hemiIntensity);
+      scene.add(hemiLight);
+
+      mainLight = new THREE.DirectionalLight(0xffffff, LIGHTING_PROFILE.mainIntensity);
+      scene.add(mainLight);
+      scene.add(mainLight.target);
+      mainLight.castShadow = LIGHTING_PROFILE.shadows;
+
+      const SHADOW_MAP_SIZE = 3072;
+      mainLight.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+      mainLight.shadow.camera.near = 0.5;
+      mainLight.shadow.camera.far = 50;
+      mainLight.shadow.bias = -0.0005;
+      mainLight.shadow.normalBias = 0.02;
+      mainLight.shadow.camera.updateProjectionMatrix();
+
+      if (renderer) {
+        renderer.shadowMap.enabled = LIGHTING_PROFILE.shadows;
+        renderer.shadowMap.type = USE_VSM_SHADOWS ? THREE.VSMShadowMap : THREE.PCFSoftShadowMap;
+      }
+
+      // 陰影承接用的地面，疊加在真實地板上顯示模型陰影(ShadowMaterial 只渲染陰影本身，其餘透明)
+      previewGround = new THREE.Mesh(
+        new THREE.PlaneGeometry(50, 50),
+        new THREE.ShadowMaterial({ opacity: 0.35 })
+      );
+      previewGround.rotation.x = -Math.PI / 2;
+      previewGround.receiveShadow = true;
+      previewGround.visible = LIGHTING_PROFILE.shadows;
+      scene.add(previewGround);
+    }
+
+    function fitShadowToModel(root) {
+      root.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(root);
+      const sphere = box.getBoundingSphere(new THREE.Sphere());
+      const radius = Math.max(sphere.radius, 1);
+
+      const worldToLocal = new THREE.Matrix4().copy(root.matrixWorld).invert();
+      modelCenterLocalOffset.copy(sphere.center).applyMatrix4(worldToLocal);
+      modelBaseLocalPoint.set(sphere.center.x, box.min.y, sphere.center.z).applyMatrix4(worldToLocal);
+
+      MAIN_LIGHT_DISTANCE = radius * 3;
+      const frustumSize = radius * 1.15;
+
+      mainLight.shadow.camera.left = -frustumSize;
+      mainLight.shadow.camera.right = frustumSize;
+      mainLight.shadow.camera.top = frustumSize;
+      mainLight.shadow.camera.bottom = -frustumSize;
+      mainLight.shadow.camera.near = Math.max(0.1, MAIN_LIGHT_DISTANCE - radius * 2);
+      mainLight.shadow.camera.far = MAIN_LIGHT_DISTANCE + radius * 8;
+      mainLight.shadow.camera.updateProjectionMatrix();
+
+      updateMainLightPosition();
+    }
+
+    function getModelWorldCenter() {
+      if (!model) return null;
+      model.updateMatrixWorld(true);
+      return modelCenterLocalOffset.clone().applyMatrix4(model.matrixWorld);
+    }
+    function getModelWorldBase() {
+      if (!model) return null;
+      model.updateMatrixWorld(true);
+      return modelBaseLocalPoint.clone().applyMatrix4(model.matrixWorld);
+    }
+
+    function updateMainLightPosition() {
+      if (!mainLight) return;
+      const rad = toRad(lightAngleDeg);
+      const dx = Math.sin(rad) * MAIN_LIGHT_DISTANCE;
+      const dz = Math.cos(rad) * MAIN_LIGHT_DISTANCE;
+      if (model) {
+        const center = getModelWorldCenter();
+        const base = getModelWorldBase();
+        mainLight.position.set(center.x + dx, center.y + MAIN_LIGHT_DISTANCE * 0.8, center.z + dz);
+        mainLight.target.position.copy(center);
+        previewGround.position.set(base.x, base.y - 0.01, base.z);
+      } else {
+        mainLight.position.set(dx, MAIN_LIGHT_DISTANCE * 0.8, dz);
+      }
+    }
+
+    function applyFlatShadingFallback(root) {
+      root.traverse((node) => {
+        if (node.isMesh && node.material) {
+          const materials = Array.isArray(node.material) ? node.material : [node.material];
+          const flatMats = materials.map((mat) => new THREE.MeshBasicMaterial({
+            map: mat.map || null,
+            color: mat.color ? mat.color.clone() : 0xffffff
+          }));
+          node.material = Array.isArray(node.material) ? flatMats : flatMats[0];
+        }
+      });
+    }
+
+    function addEdgeOutlines(root) {
+      const edgeMaterial = new THREE.LineBasicMaterial({ color: EDGE_COLOR });
+      root.traverse((node) => {
+        if (node.isMesh && node.geometry) {
+          const edgesGeo = new THREE.EdgesGeometry(node.geometry, EDGE_ANGLE_THRESHOLD);
+          const edgeLines = new THREE.LineSegments(edgesGeo, edgeMaterial);
+          node.add(edgeLines);
+        }
+      });
+    }
+
+    function forceDoubleSidedMaterials(root) {
+      root.traverse((node) => {
+        if (node.isMesh && node.material) {
+          const materials = Array.isArray(node.material) ? node.material : [node.material];
+          materials.forEach((mat) => { mat.side = THREE.DoubleSide; });
+        }
+      });
+    }
+
+    function enableShadowsOnModel(root) {
+      root.traverse((node) => {
+        if (node.isMesh) {
+          node.castShadow = true;
+          node.receiveShadow = true;
+        }
+      });
+    }
+
+    function loadModel() {
+      const loader = new GLTFLoader();
+      loader.load(
+        MODEL_URL,
+        (gltf) => {
+          model = gltf.scene;
+          model.scale.set(MODEL_SCALE, MODEL_SCALE, MODEL_SCALE);
+          model.visible = false;
+          if (USE_FLAT_SHADING_FALLBACK) applyFlatShadingFallback(model);
+          if (FORCE_DOUBLE_SIDED) forceDoubleSidedMaterials(model);
+          if (SHOW_EDGES) addEdgeOutlines(model);
+          enableShadowsOnModel(model);
+          scene.add(model);
+          fitShadowToModel(model);
+          updateStatus('Model loaded. Tap "Place Here" if it is not placed correctly, or wait for automatic placement.');
+
+          // 世界追蹤一開始就自動放一次(對應 Android 版「偵測到平面自動放置」的預設行為)
+          if (lastCameraPosition && lastCameraForward) {
+            placeModelInFrontOfCamera('Model placed in front of you — tap "Calibrate by GPS" to reposition using GPS coordinates instead.');
+          }
+        },
+        undefined,
+        (err) => {
+          console.error('GLTF load error', err);
+          updateStatus('Failed to load model. Please check the ' + MODEL_URL + ' path.');
+        }
+      );
+    }
+
+    // ---------------------------------------------------------------
+    // 預設放置邏輯：8th Wall 的世界追蹤沒有「掃描地板取得平面高度」這個步驟，
+    // 所以這裡改成把模型放在使用者前方固定距離處，高度用 ASSUMED_EYE_HEIGHT 估計地板位置。
+    // 「Place Here」按鈕也是呼叫這個函式，方便隨時重新放到使用者目前面對的方向。
+    // ---------------------------------------------------------------
+    function placeModelInFrontOfCamera(successMessage) {
+      if (!model) { updateStatus('Model is still loading...'); return; }
+      if (!lastCameraPosition || !lastCameraForward) { updateStatus('Tracking not ready yet. Cannot place model.'); return; }
+
+      model.position.set(
+        lastCameraPosition.x + lastCameraForward.x * PLACEMENT_DISTANCE,
+        lastCameraPosition.y - ASSUMED_EYE_HEIGHT,
+        lastCameraPosition.z + lastCameraForward.z * PLACEMENT_DISTANCE
+      );
+      model.rotation.y = Math.atan2(-lastCameraForward.x, -lastCameraForward.z);
+      model.visible = true;
+      modelPlaced = true;
+      updateStatus(successMessage || 'Model placed in front of you.');
+    }
+
+    // ---------------------------------------------------------------
+    // GPS 校準邏輯：跟 Android/WebXR 版本相同的 Haversine + 羅盤換算，
+    // 只是相機位置/朝向現在是每一幀從 8th Wall 驅動的 Three.js camera 直接快取，
+    // 高度一樣用 ASSUMED_EYE_HEIGHT 估計地板位置(見上面的說明)。
+    // ---------------------------------------------------------------
+    function placeModelFromCache(successMessage) {
+      if (!model) { updateStatus('Model is still loading...'); return; }
+      if (userLat === null || userLon === null) { updateStatus('Waiting for GPS...'); return; }
+      if (currentHeading === null) { updateStatus('Waiting for compass data...'); return; }
+      if (!lastCameraPosition || !lastCameraForward) { updateStatus('Waiting for tracking to start...'); return; }
+
+      const distance = haversineDistance(userLat, userLon, TARGET_LAT, TARGET_LON);
+      const targetBearing = bearing(userLat, userLon, TARGET_LAT, TARGET_LON);
+
+      const relativeAngle = toRad(targetBearing - currentHeading);
+      const targetDir = lastCameraForward.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), -relativeAngle);
+
+      model.position.set(
+        lastCameraPosition.x + targetDir.x * distance,
+        lastCameraPosition.y - ASSUMED_EYE_HEIGHT,
+        lastCameraPosition.z + targetDir.z * distance
+      );
+      model.rotation.y = Math.atan2(targetDir.x, targetDir.z);
+
+      model.visible = true;
+      modelPlaced = true;
+      updateStatus(successMessage || 'Model repositioned using GPS coordinates — stability now relies entirely on device SLAM tracking.');
+    }
+
+    // ---------------------------------------------------------------
+    // 8th Wall 啟動流程
+    // ---------------------------------------------------------------
+    startBtn.addEventListener('click', onStart);
+
+    async function onStart() {
+      startBtn.disabled = true;
+      startBtn.textContent = 'Starting...';
+
+      try {
+        updateStatus('Requesting GPS permission...');
+        await startGeolocation();
+      } catch (e) {
+        updateStatus('Failed to get GPS permission. The model can still be shown, but not positioned by GPS.');
+      }
+
+      // iOS 一定要在使用者手勢(這個按鈕點擊)當下呼叫，不能延後到非同步流程外面才呼叫
+      startCompass();
+
+      updateStatus('Loading AR engine...');
+      runXR8WhenReady();
+    }
+
+    function runXR8WhenReady() {
+      if (window.XR8) {
+        startXR8();
+      } else {
+        window.addEventListener('xrloaded', startXR8);
+        // 保險：如果引擎檔案載入失敗或太久沒好，給使用者一個明確的錯誤訊息，而不是永遠卡在 Starting...
+        setTimeout(() => {
+          if (!arStarted) {
+            updateStatus('AR engine failed to load. Please check your network connection and reload the page.');
+            startBtn.disabled = false;
+            startBtn.textContent = 'Start AR Experience';
+          }
+        }, 15000);
+      }
+    }
+
+    function startXR8() {
+      window.removeEventListener('xrloaded', startXR8);
+
+      const appPipelineModule = {
+        name: 'poc-webar-app',
+
+        // onStart 只會呼叫一次，在相機畫面開始的時候——這時 XR8.Threejs 的 scene/camera/renderer
+        // 已經準備好了(因為 XR8.Threejs.pipelineModule() 排在這個模組前面)，直接拿來用即可。
+        onStart: () => {
+          const xrScene = XR8.Threejs.xrScene();
+          scene = xrScene.scene;
+          camera = xrScene.camera;
+          renderer = xrScene.renderer;
+
+          // 官方文件建議在 onStart 時同步一次 camera 的 projection matrix，
+          // 讓 8th Wall 的 6DoF 追蹤跟這個 three.js camera 的起始位置/朝向對齊
+          XR8.XrController.updateCameraProjectionMatrix({
+            origin: camera.position,
+            facing: camera.quaternion,
+          });
+
+          // 避免手機瀏覽器把畫面上的觸控手勢當成滾動/縮放頁面，干擾 AR 檢視體驗
+          const canvasEl = document.getElementById('camerafeed');
+          canvasEl.addEventListener('touchmove', (event) => { event.preventDefault(); }, { passive: false });
+
+          setupLighting();
+          loadModel();
+
+          arStarted = true;
+          startBtn.style.display = 'none';
+          adjustRow.style.display = 'flex';
+          floorRow.style.display = 'flex';
+          adjustRow2.style.display = 'flex';
+          lightRow.style.display = 'flex';
+          infoBtn.style.display = 'block';
+
+          updateStatus('World tracking started. Loading model...');
+        },
+
+        // onUpdate 每一幀都會呼叫(在畫面渲染之前)，這裡對應原本 WebXR 版本 onXRFrame 裡
+        // 「把相機位置/朝向存成一般數值與向量」那段邏輯，供按鈕之後安全使用
+        onUpdate: () => {
+          if (!camera) return;
+          lastCameraPosition = { x: camera.position.x, y: camera.position.y, z: camera.position.z };
+          const fwd = new THREE.Vector3();
+          camera.getWorldDirection(fwd);
+          fwd.y = 0;
+          fwd.normalize();
+          lastCameraForward = fwd;
+
+          updateMainLightPosition();
+        },
+
+        onException: (error) => {
+          console.error('XR8 exception', error);
+          updateStatus('AR error: ' + (error && error.message ? error.message : String(error)));
+        },
+      };
+
+      XR8.addCameraPipelineModules([
+        XR8.GlTextureRenderer.pipelineModule(), // 畫出相機畫面(背景)
+        XR8.Threejs.pipelineModule(),           // 建立/驅動 three.js scene + camera + renderer
+        XR8.XrController.pipelineModule(),      // 啟用 6DoF SLAM 世界追蹤
+        appPipelineModule,                      // 這個專案自己的場景/模型/GPS 邏輯
+      ]);
+
+      XR8.run({ canvas: document.getElementById('camerafeed') });
+    }
+
+    window.addEventListener('resize', () => {
+      if (!camera || !renderer) return;
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
